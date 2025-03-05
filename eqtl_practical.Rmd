@@ -1,0 +1,674 @@
+---
+title: "eQTL Practical: GEUVADIS Consortium Data"
+author: "Iain Konigsberg, Wei Zhou, & Barbara Stranger"
+date: 'Updated: `r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: false
+---
+
+```{r init, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "D:/isgw/")
+knitr::opts_chunk$set(eval = FALSE)
+knitr::opts_chunk$set(include = FALSE)
+
+```
+
+# Background
+
+**Expression quantitative trait loci (eQTL)** analysis identifies genetic variants associated with gene expression levels. Proper **quality control (QC)** is essential to ensure reliable results. Below, we outline standard QC steps for genotype data, RNA-seq count data, and covariates, along with checks for proper data integration.
+
+### Quality Control for Genotype Data
+Genotype data typically comes in formats such as VCF, PLINK (.bed/.bim/.fam), or similar.
+
+#### 1.1 Sample-Level QC
+- **Check sex consistency** by comparing inferred genetic sex (from X and Y chromosome markers) with reported sex in metadata.
+-	Remove individuals with **high missingness** (typically >5% missing genotypes).
+-	Check for **relatedness** and remove duplicates to ensure no unexpected familial relationships or sample duplications.
+
+#### 1.2 Variant-Level QC
+-	Remove SNPs with **high missingness** (e.g., variants missing in more than 5% of samples).
+-	Apply **Hardy-Weinberg Equilibrium (HWE)** filtering to exclude variants that significantly deviate from expected genetic distributions (p > 1e-6).
+-	Filter for **minor allele frequency (MAF)** to retain only common variants (e.g., MAF > 5%).
+
+#### 1.3 Population Structure Correction
+-	Perform **principal component analysis (PCA)** on the genotype data to detect population stratification. 
+- Retain key principal components (PCs) as covariates in the eQTL analysis to account for ancestry-related effects.
+
+### Quality Control for RNA-Seq Data
+The RNA-seq count file used for eQTL analysis is a gene expression count matrix (TSV/CSV format). The matrix represents raw or normalized gene expression counts for multiple samples.
+
+Structure of the File:
+1.	Rows: Genes (or transcripts, depending on the quantification method).
+2.	Columns: Individual samples (biological replicates, conditions, etc.).
+3.	First column: Unique gene/transcript identifiers (e.g., Ensembl IDs or gene symbols).
+4.	Remaining columns: Integer values representing raw or normalized counts per sample.
+
+
+#### 2.1 Sample-Level QC
+-	Identify and **remove outliers** using PCA or hierarchical clustering.
+-	Check **sex consistency** using expression of sex-specific genes (e.g., XIST for females, Y-linked genes for males).
+-	Remove low-quality samples based on quality metrics such as RNA integrity number (RIN < 6) and sequencing depth (< 10M reads per sample).
+
+#### 2.2 Gene-Level QC
+-	Remove lowly expressed genes, keeping only those expressed in a sufficient number of samples (e.g., > 1-10 CPM in > 20% of samples).
+-	Transformation for Normality for eQTL Models:
+    - Most eQTL analyses assume a linear relationship between genotype and expression.
+    - Raw counts follow a negative binomial distribution, which is not suitable for regression.
+    -	Standard transformations applied to raw counts:
+      - log2(CPM + 1) (log-transformed counts per million)
+      - voom transformation (for modeling mean-variance trends, see limma-voom)
+      - inverse normal transformation (ranks gene expression per gene across samples and applies normal quantile transformation (mean = 0, SD =1). *Most common for eQTL mapping*
+
+### Quality Control for Covariates
+-	Address missing data by either imputing values or removing samples with incomplete covariate information.
+-	Assess correlations between covariates, ensuring that highly correlated variables (e.g., PEER factors and genotype PCs) do not introduce collinearity (r < 0.8).
+-	Include genotype principal components (typically >3, depending on cohort) and PEER factors (typically 10-50) to account for unknown batch effects and confounding.
+-	Correlate PEER factors with known covariates to assess whether they capture relevant experimental or biological variations.
+
+### Ensuring Sample Matching Across Data Types
+-	Ensure sample IDs are consistent across genotype, expression, and covariate files.
+-	Remove unmatched samples to ensure a 1:1 correspondence across data types.
+
+***
+
+## Overview of the GEUVADIS Dataset
+
+You are going to be performing an eQTL analysis today. You will be using data from the GEUVADIS project. The *GEUVADIS (Genetic European Variation in Health and Disease) Project* is an international initiative aimed at characterizing the impact of genetic variation on gene expression. By integrating whole-genome sequencing with RNA sequencing data from lymphoblastoid cell lines of 462 individuals from the 1000 Genomes Project, GEUVADIS has provided a rich resource for studying expression quantitative trait loci (eQTLs). This dataset has been instrumental in understanding how genetic variants influence gene regulation across populations and has contributed to advances in functional genomics, disease mapping, and precision medicine. The project’s findings serve as a foundation for linking genetic variation to molecular phenotypes, enhancing our ability to interpret genome-wide association studies (GWAS) and their implications for human health.
+
+You have been provided with 3 files for this practical:
+
+- **geuvadis_chr22_genotypes.txt**: QC’d genotype data from chr22 (MAF > 5%, SNVs only, HWE p-value < 1e-6 removed).  
+
+- **geuvadis_chr22_rnaseq.txt**: PEER-residualized RPKM on chr22 genes (some non-coding genes removed).  
+
+- **geuvadis_covariates.txt**: Sample covariates (including sex and genotype PCs).  
+
+***
+
+# Setup
+
+Load required R packages for the practical and set your working directory. 
+
+```{r message=F}
+# Load necessary libraries
+library(data.table) # data I/O
+library(dplyr) # data frame manipulation
+library(stringr) # string manipulation
+library(MatrixEQTL) # eQTL calculation
+library(coloc) # Colocalization analysis
+library(locuszoomr) # Locuszoom plots
+library(EnsDb.Hsapiens.v75) # Gene mapping for locuszoom plots
+
+# Set working directory
+#setwd("~/practicals/4.3.GenomeAnnotation_WeiZhou/final")
+
+```
+
+***
+
+# Read and Prepare Data
+
+You will now load the genotype, RNA-Seq, and covariate files and answer some basic questions about their contents.
+
+## Genotypes
+
+- Genotyping was performed EXPAND!!!
+
+- The genotype data was filtered using **PLINK2**. 
+
+- Original genotypes were downloaded from the **[1000 Genomes Project](https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/)**. 
+
+- The dataset has been restricted to subjects from the **YRI (Yoruba in Ibadan, Nigeria) population**.
+
+```{r}
+geno = fread("geuvadis_chr22_genotypes.txt", data.table = F)
+head(geno[,1:10])
+
+```
+
+**Q1: How many samples are there?** *A: 108*
+
+```{r}
+nrow(geno) 
+```
+
+**Q2: How many variants are included?** *A: 95,190*
+
+```{r}
+ncol(geno) - 6 
+```
+
+## RNA-Seq
+
+- The RNA-Seq data was obtained from the **[GEUVADIS project](https://www.ebi.ac.uk/biostudies/arrayexpress/studies/E-GEUV-1?query=geuvadis)**.
+
+- It contains normalized gene expression counts. 
+
+```{r}
+rna = fread("geuvadis_chr22_rnaseq.txt", data.table = F)
+head(rna)[,1:10]
+
+```
+
+**Q3: How many subjects are there?** *A: 462*
+
+```{r}
+ncol(rna) - 4
+```
+
+**Q4: How many genes are there?** *A: 420*
+
+```{r}
+nrow(rna)
+
+```
+
+**Q5: Confirm that all genes are on chromosome 22.** 
+
+```{r}
+table(rna$Chr) 
+```
+
+
+## Covariates
+
+- Covariate information was downloaded from the **[1000 Genomes Project](https://www.internationalgenome.org/data-portal/sample)**. 
+
+- Genetic principal components were generated previously for the [2024 IGES tutorial on PRS calculation](https://github.com/konigsbergi/iges-workshop-2024). 
+
+```{r}
+covar = fread("geuvadis_covariates.txt", data.table = F)
+
+head(covar)
+```
+
+**Q6: How many subjects are included?** *A: 4,978*
+
+```{r}
+nrow(covar) 
+```
+
+**Q7: How many columns are included?** *A: 14*
+
+```{r}
+ncol(covar)
+```
+
+**Q8: Are there any missing data in the covariate file?** *A: Yes*
+
+**Q9: What are some of the options you could do if you had missing values in the matrix?**  
+
+- do nothing  
+- impute missing values  
+- Remove the sample or covariate
+
+For our purposes, we will subset to samples present across all 3 files. This will remove missing data from the covariates file. 
+
+**Q10: Do all files have the expected format?**  
+
+- Genotypes? *A: Yes* 
+- RNA-seq? *A: Yes*   
+- Covariates? *A: Yes*  
+
+**Q11: Do all files have the same set of subjects?** *A: No*
+
+***
+
+# Formatting for MatrixEQTL
+
+MatrixEQTL analysis requires 3 files: genotypes, normalized expression, and covariates. Now you will focus on preparing the genotypes, RNA-Seq, and covariate data for use by MatrixEQTL. 
+
+## Genotypes
+
+To prepare genotype data for MatrixEQTL, we need to prepare 2 files:   
+
+- Genotype values
+- Genotype locations
+
+```{r}
+# Extract genotype values
+geno_vals = geno %>% dplyr::select(IID, starts_with("22")) 
+rownames(geno_vals) = geno_vals$IID
+geno_vals$IID = NULL
+geno_vals = geno_vals[rownames(geno_vals) %in% colnames(rna), ] 
+geno_vals = as.data.frame(t(geno_vals)) 
+
+# Filter rows where each homozygous genotype appears at least 4 times
+geno_vals = geno_vals[rowSums(geno_vals == 0) >= 3 & rowSums(geno_vals == 2) >= 3, ]
+
+# Write out formatted genotypes
+fwrite(geno_vals, "geno_vals.txt", row.names = T)
+
+# genotype locus information
+geno_locs = str_split(rownames(geno_vals), ":", simplify = T)
+geno_locs = as.data.frame(cbind(rownames(geno_vals), geno_locs))
+colnames(geno_locs) = c("snp", "chr", "pos")
+geno_locs$pos = str_split(geno_locs$pos, "\\_", simplify = T)[,1]
+
+# Write out formatted genotype positions
+fwrite(geno_locs, "geno_locs.txt")
+
+```
+
+## RNA-Seq
+
+To prepare RNA-Seq data for MatrixEQTL, we need to prepare 2 files:   
+
+- RNA-Seq values
+- Gene locations
+
+```{r}
+rna_vals = rna[, c(2, 5:ncol(rna))]
+rownames(rna_vals) = rna_vals$Gene_Symbol
+rna_vals$Gene_Symbol = NULL
+rna_vals = rna_vals[, colnames(rna_vals) %in% colnames(geno_vals)] #445
+
+# Write out formatted covariates
+fwrite(rna_vals, "rna_vals.txt", row.names = T)
+
+# RNA locus information
+rna_locs = rna[, 2:4]
+rna_locs$Coord = rna_locs$Coord - 1e6
+rna_locs$Coord2 = rna_locs$Coord + 2e6
+names(rna_locs) = c("geneid", "chr", "s1", "s2")
+
+# Write out formatted covariates
+fwrite(rna_locs, "rna_locs.txt")
+
+```
+
+## Covariates
+
+We will use sex and 5 genetic principal components as covariates in modeling. 
+
+```{r}
+rownames(covar) = covar$`Sample name`
+covar = covar %>% dplyr::select(Sex, PC1, PC2, PC3, PC4, PC5)
+covar = covar[rownames(covar) %in% colnames(rna_vals), , drop = F]
+
+# Convert sex to a numeric (binary) variable
+covar$Sex[covar$Sex == "male"] = 0
+covar$Sex[covar$Sex == "female"] = 1
+
+# Order covariates by sample name
+covar = covar[order(rownames(covar)), ]
+
+# Confirm sample order matches between files
+all(rownames(covar) == colnames(rna_vals))
+
+# Write out formatted covariates
+fwrite(as.data.frame(t(covar)), "covariates.txt")
+
+```
+
+***
+
+# MatrixEQTL Analysis
+
+You are going to perform both cis-eQTL and trans-eQTL analyses simultaneously. A cis-eQTL analysis focuses on testing SNPs physically near (or in) the gene being tested. The cis definition must be specified. A common cis-definition is: +/-Mb from the TSS, such that for a given gene, only SNPs inside the specified window will be tested for association with gene expression. Because each gene has its’ own location in the genome, the set of SNPs being tested varies by gene. A cis-eQTL analysis focuses on regions surrounding the gene that are most likely to harbor regulatory elements that affect the gene. Where the cis-eQTL analysis focuses on SNPs physically close to a given gene, a trans-eQTL analysis will test for associations with all SNPs that are not close to the gene (ie on the same chromosome, but far away, or on different chromosomes. A trans-eQTL analysis involves conducting many statistical tests (MANY! SNPs per gene x many genes), thus multiple testing correction is imperative to control for false positive associations. 
+ 
+You will use the software package MatrixEQTL, designed for fast eQTL analysis on large datasets. MatrixEQTL can test for association between genotype and gene expression using linear regression with either additive or ANOVA genotype effects. The models can include covariates to account for factors as population stratification, sex, and clinical/experimental variables variables. For more details see Shabalin (2012) [LINK].
+
+To perform both eQTL analyses, you will specify the following model:  
+ 
+**PEER-normalized gene expression ~ Sex + PC1 + PC2 + PC3 + PC4 + PC5**
+
+**Q12: How many significant (FDR <  0.05) trans-eQTLs (SNP-gene pairs) have you found?** *A: XXX*
+ 
+**Q13: How many eGenes have you found? Hint: an eGene is defined as having > 1 SNP associated with its’ expression** *A: XXX*
+
+## Load genotype data
+
+```{r}
+snps = SlicedData$new()
+snps$fileDelimiter = ","      
+snps$fileOmitCharacters = "NA" 
+snps$fileSkipRows = 1          
+snps$fileSkipColumns = 1       
+snps$fileSliceSize = 2000      
+snps$LoadFile("geno_vals.txt")
+
+# Read in genotype positions
+snpspos = read.table("geno_locs.txt", sep = ",", header = T)
+```
+
+## Load gene expression data
+
+```{r}
+gene = SlicedData$new()
+gene$fileDelimiter = ","      
+gene$fileOmitCharacters = "NA" 
+gene$fileSkipRows = 1          
+gene$fileSkipColumns = 1      
+gene$fileSliceSize = 2000      
+gene$LoadFile("rna_vals.txt")
+
+# Read in gene positions
+genepos = read.table("rna_locs.txt", sep = ",", header = T)
+```
+
+## Load covariates
+
+```{r}
+# Read in covariates
+cvrt = SlicedData$new()
+cvrt$fileDelimiter = ","      
+cvrt$fileOmitCharacters = "NA"
+cvrt$fileSkipRows = 1
+cvrt$fileSkipColumns = 0
+cvrt$LoadFile("covariates.txt")
+
+```
+
+## Run the analysis
+
+```{r}
+# Run MatrixEQTL
+me = Matrix_eQTL_main(
+  snps = snps,
+  gene = gene,
+  cvrt = cvrt,
+  output_file_name = "trans_eqtls.txt",
+  pvOutputThreshold = 1e-3, # p-value output threshold for trans-eqtls
+  useModel = modelLINEAR,
+  errorCovariance = numeric(),
+  verbose = TRUE,
+  output_file_name.cis = "cis_eqtls.txt",
+  pvOutputThreshold.cis = 1e-3, # p-value output threshold for cis-eqtls
+  snpspos = snpspos,
+  genepos = genepos,
+  cisDist = 1e6, # distance threshold for cis associations
+  pvalue.hist = "qqplot",
+  min.pv.by.genesnp = FALSE,
+  noFDRsaveMemory = FALSE) 
+
+```
+
+***
+
+# Downstream Results 
+
+You will now do some preliminary evaluation of the eQTLs you have generated.  
+
+```{r}
+# Check the structure of results
+str(me)
+```
+
+***
+
+## QQ Plot
+
+You will now plot a **quantile-quantile (QQ) plot**, which visually compares the distribution of observed p-values from your analysis to the expected uniform distribution under the null hypothesis. This plot helps assess whether there is an enrichment of small p-values, indicating potential true associations, or if the distribution follows the null expectation. A well-calibrated analysis should show most points aligning along the diagonal reference line, while deviations (particularly at the lower end of p-values) suggest significant signals. Systematic inflation or deflation of p-values can indicate confounding effects, population structure, or technical biases, which may require further investigation and correction. MatrixEQTL provides functionality that automatically returns a QQ plot stratified by cis and trans eQTLs. 
+
+```{r}
+# Generate QQ plots
+plot(me)
+```
+
+**Q14: Do cis and trans eQTLs seem well-calibrated?** *A: Yes*
+
+**Q15: Do cis or trans eQTLs demonstrate stronger hits?** *A: cis-eQTLs*
+
+The title of the QQ plot displays how many tests were performed for cis- and trans-eqtls, respectively. 
+
+**Q16: How many cis- and trans- associations were tested?** *A: 4,189,956 cis, 35,789,844 trans*
+
+***
+
+## Basic Results
+
+```{r}
+# Create objects for cis and trans eqtls
+cis = me$cis$eqtls
+trans = me$trans$eqtls
+
+```
+
+**Q17: What is the smallest nominal p-value you’ve found?** *A: 7.43e-28*
+
+**Q18: What is the smallest FDR-adjusted p-value you’ve found?** *A: 7.78e-22*
+
+
+```{r}
+cis[1, ]
+
+```
+
+A cis-eQTL analysis involves conducting many statistical tests (many SNPs per gene x many genes), thus multiple testing correction is imperative to control for false positive associations. MatrixEQTL uses the qvalue method to perform multiple testing correction. EXPAND!!!!!!!!!!
+
+**Q19: How many significant (FDR <  0.05) cis-eQTLs (SNP-gene pairs) have you found?** *A: 7,525*
+
+```{r}
+nrow(cis)
+
+```
+
+**Q20: How many cis eGenes have you found?** *A: 396*
+
+```{r}
+length(table(cis$gene))
+```
+
+**Q21: How many trans-eQTLs (SNP-gene pairs) have you found?** *A: 1,802*
+
+```{r}
+nrow(trans)
+```
+
+**Q22: How many trans eGenes have you found?** *A: 241*
+
+```{r}
+length(table(trans$gene))
+```
+
+
+```{r}
+
+head(cis)
+
+head(trans)
+
+```
+
+***
+
+## Distance Between eGenes and SNPs
+
+You will now calculate distance between SNPs and eGenes. Once you've done so, plot histograms of distances for both cis and trans eQTLs. 
+
+```{r}
+# define positions
+cis$chrom = str_split(cis$snps, ":", simplify = T)[,1]
+cis$pos = str_split(cis$snps, ":", simplify = T)[,2]
+cis$pos = str_split(cis$pos, "_", simplify = T)[,1]
+
+trans$chrom = str_split(trans$snps, ":", simplify = T)[,1]
+trans$pos = str_split(trans$snps, ":", simplify = T)[,2]
+trans$pos = str_split(trans$pos, "_", simplify = T)[,1]
+
+cis$distance = as.numeric(cis$pos) - as.numeric(genepos$s1[match(cis$gene, genepos$geneid)] + 1e6) 
+trans$distance = as.numeric(trans$pos) - as.numeric(genepos$s1[match(trans$gene, genepos$geneid)] + 1e6) 
+
+# Plot histograms of distances for cis and trans eQTLs
+hist(cis$distance, main = "Cis eQTL Distances", xlab = "Distance from TSS (bp)", col = "red", breaks = 50)
+```
+
+**Q23: Do cis-eQTLs appear enriched for a certain distance?** *A: Gene start sites*
+
+Now plot trans-eQTL distances. 
+
+```{r}
+
+hist(trans$distance, main = "Trans eQTL Distances", xlab = "Distance from TSS (bp)", col = "blue", breaks = 50)
+
+```
+
+
+
+***
+
+## Boxplots for Top eGenes
+
+Next you are going to visualize some of the cis-eQTLs. The idea is to select a specific SNP-gene pair and plot gene expression by genotype. 
+
+```{r}
+# Extract top eGenes for cis and trans
+top_cis_gene = cis$gene[1]
+top_trans_gene = trans$gene[1]
+
+geno_sub_cis = geno_vals[rownames(geno_vals) %in% cis$snps[1], , drop = FALSE]
+rna_sub_cis = rna_vals[rownames(rna_vals) %in% top_cis_gene, , drop = FALSE]
+
+df_cis = data.frame(SNP = as.factor(t(geno_sub_cis)), Gene = as.numeric(t(rna_sub_cis)))
+boxplot(Gene ~ SNP, data = df_cis, main = paste("Expression of", top_cis_gene, "by Genotype"))
+
+geno_sub_trans = geno_vals[rownames(geno_vals) %in% trans$snps[1], , drop = FALSE]
+rna_sub_trans = rna_vals[rownames(rna_vals) %in% top_trans_gene, , drop = FALSE]
+
+df_trans = data.frame(SNP = as.factor(t(geno_sub_trans)), Gene = as.numeric(t(rna_sub_trans)))
+boxplot(Gene ~ SNP, data = df_trans, main = paste("Expression of", top_trans_gene, "by Genotype"))
+```
+
+**Q24: Which allele is associated with higher gene expression of TTC38?** *A: the minor allele*
+
+**Q25: Is the eQTL effect size larger for the TTC38 cis-eQTL or for the IGLL3P trans-eQTL? Hint: the eQTL effect size can be quantified as the slope of the regression, or the log allelic fold change (aFC), which represents the fold difference in gene expression between haplotypes carrying the reference and alternative alleles at a given genetic variant.**
+
+***
+
+## LocusZoom Plots
+
+Another way to visualize eQTL results is to plot summary statistics along the genome. In GWAS, we typically use a **Manhattan plot** to display associations across the entire genome. However, for cis-eQTL analysis, we are often interested in specific regions surrounding a gene, as each gene has its own cis-window (~20K genes in total). To explore associations at the gene level, **LocusZoom** is a widely used tool for visualizing genetic associations in their genomic context.  
+You will generate LocusZoom plots for both the top cis-eQTL and top trans-eQTL associations.  
+
+
+First, extract summary statistics for all SNP-gene pairs tested for the gene of interest from the MatrixEQTL output file. Next, you will generate a LocusZoom plot for each gene. 
+
+To further refine association signals, you can use [LDlink](https://ldlink.nih.gov/) to retrieve LD information. LDlink requires an API token, which you can obtain by registering an account at the following link: https://ldlink.nih.gov/?tab=apiaccess. After receiving your token via email, replace the 'token = ' argument in the code below with your access token.
+
+```{r}
+cis$snps = stringr::str_split(cis$snps, "_", simplify = T)[,1]
+cis$snps = paste0("chr", cis$snps)
+
+# Plot top cis eGene
+loc = locus(data = cis[cis$gene == cis$gene[1], ], gene = cis$gene[1], flank = 1e5, ens_db = "EnsDb.Hsapiens.v75")
+summary(loc)
+loc = link_LD(loc, pop = "YRI", token = "47d02c2de92e") 
+loc = link_recomb(loc, table = "hapMapRelease24YRIRecombMap") 
+locus_plot(loc)
+
+```
+
+**Q26: Where, relative to TTC38, are the strongest associations?** *A: gene body*  
+
+- 5’  
+- 3’  
+- gene body
+
+
+```{r}
+
+# Trans
+trans$snps = stringr::str_split(trans$snps, "_", simplify = T)[,1]
+trans$snps = paste0("chr", trans$snps)
+
+# Plot top trans eGene
+loc = locus(data = trans[trans$gene == trans$gene[1], ], gene = trans$gene[1], flank = c(1e4, 8e6), ens_db = "EnsDb.Hsapiens.v75")
+
+summary(loc)
+
+loc = link_LD(loc, pop = "YRI", token = "47d02c2de92e") 
+loc = link_recomb(loc, table = "hapMapRelease24YRIRecombMap") 
+locus_plot(loc, filter_gene_name = "IGLL3P") # only plot eGene for gene track due to large chromosomal window
+
+```
+
+**Q27: How far is the SNP from IGLL3P?** *A: ~ 7 Mb*  
+
+
+***
+
+# Database Look-ups
+
+Now that you have identified eQTLs, the next step is to explore the SNPs and eGenes using publicly available databases. These resources provide insights into the functional context of genetic variants and their role in gene regulation and disease.
+
+#### Key Databases:
+
+- [UCSC Genome Browser](https://genome.ucsc.edu/cgi-bin/hgGateway): A web-based tool for visualizing and analyzing genomic data, integrating reference genomes, annotations, and experimental datasets.   
+- [GTEx (Genotype-Tissue Expression Project)](https://www.gtexportal.org/home/): A resource linking genetic variation to gene expression across multiple human tissues to study regulatory effects and disease associations.  
+- [Open Targets Genetics](https://genetics.opentargets.org/): A platform leveraging genetic association data to prioritize and explore potential drug targets based on human genetics.  
+
+***
+
+## UCSC Genome Browser
+
+Use the [UCSC genome browser](https://genome.ucsc.edu/cgi-bin/hgGateway) to visualize the genomic location of your top cis-eQTL.
+
+1. Go to the UCSC Genome Browser.
+2. Ensure you are using GRCh37/hg19 as the reference genome.
+3. Enter the chromosome:position of your top cis-eQTL (e.g., 22:46687220) into the search bar and press enter.
+4. Locate the dbSNP track and click on your variant to retrieve its rsID.
+
+**Q28:  What rsid is associated with our variant of interest?** *A: rs73886792*
+
+This rsID can now be used for further exploration in Open Targets Genetics. 
+
+***
+
+## Open Targets Genetics 
+
+Use Open Targets Genetics to investigate associations between your variant and gene expression, disease traits, and drug targets.
+
+1. Go to [Open Targets Genetics](https://genetics.opentargets.org/). 
+2. Enter the rsid you obtained from the UCSC Genome Browser into the search bar. 
+3. Select the autocompleted variant, which should have the same rsid. 
+
+**Q29: Which population has the highest effect allele frequency?** *A: African/African-American*
+
+**Q30: What genes does this variant act as an eQTL for?** *A: TTC38, TRMU, PKDREJ*
+
+***
+
+## GTEx
+
+Use the GTEx Portal to analyze tissue-specific gene expression and regulatory variants.
+
+1. Go to the the [Genotype-Tissue Expression (GTEx) Portal](https://www.gtexportal.org/home/). 
+2. Enter **TTC38** in the search bar at the top right corner of the page.
+3. Explore the bulk tissue expression data to determine where TTC38 is most highly expressed.
+
+**Q31: What tissue is TTC38 most highly expressed in?** *A: Liver*
+
+4. Scroll down to the single-cell expression tab to determine its primary cell type of expression.
+
+**Q32: What cell type is TTC38 most frequently expressed in?** *A: Adipocytes*
+
+5. Scroll further down to the single-tissue eQTL tab to identify top eQTL associations.
+
+**Q33: What is the top single tissue eqtl?** *A: chr22_46292311_C_A_b38; rs6008552*
+
+**Q34: What tissue is this eQTL in?** *A: Artery - Tibial*
+
+6. Finally, explore the single-tissue sQTL tab to identify splicing quantitative trait loci (sQTLs).
+
+**Q35: What is the top single tissue sQTL?** *chr22_46292311_C_A_b38; rs6008552*
+
+**Q36: What tissue is this sQTL in?** *A: Nerve - Tibial*
+
+
+<hr style="border-top: 3px solid #000;">
+
+# Resources
+
+Below are some potentially useful resources. 
+
+- [GEUVADIS eQTL paper](https://pubmed.ncbi.nlm.nih.gov/24037378/)
+- [MatrixEQTL vignette](https://www.bios.unc.edu/research/genomic_software/Matrix_eQTL/runit.html)
+
